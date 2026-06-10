@@ -76,7 +76,45 @@ function defaultSpawnOptions(extra = {}) {
 }
 
 /**
+ * Windows 上从 npm 全局安装目录找到 openclaw.mjs 的绝对路径
+ * 返回 null 表示未找到，由调用方降级走 cmd.exe
+ */
+function resolveWin32MjsPath(bin) {
+  if (!IS_WIN) return null
+
+  // bin 本身已是 .mjs
+  const lower = bin.toLowerCase()
+  if (lower.endsWith('.mjs')) {
+    if (fs.existsSync(bin)) return bin
+    return null
+  }
+  if (path.isAbsolute(bin) && lower.endsWith('.cmd') && fs.existsSync(bin)) {
+    // bin 是 .cmd 绝对路径，如 C:\Users\xxx\AppData\Roaming\npm\openclaw.cmd
+    // 同目录 node_modules/openclaw/openclaw.mjs
+    const mjs = path.join(path.dirname(bin), 'node_modules', 'openclaw', 'openclaw.mjs')
+    if (fs.existsSync(mjs)) return mjs
+  }
+
+  // 在 %APPDATA%\npm 下查找
+  const appData = process.env.APPDATA
+  if (appData) {
+    const npmDir = path.join(appData, 'npm')
+    const mjs = path.join(npmDir, 'node_modules', 'openclaw', 'openclaw.mjs')
+    if (fs.existsSync(mjs)) return mjs
+  }
+
+  // 当前工作目录下的 node_modules
+  const localMjs = path.join(process.cwd(), 'node_modules', 'openclaw', 'openclaw.mjs')
+  if (fs.existsSync(localMjs)) return localMjs
+
+  return null
+}
+
+/**
  * 解析跨平台 OpenClaw 调用方式
+ *
+ * Windows 上的关键优化：找到 openclaw.mjs 后用 node.exe 直接执行，
+ * 绕过 cmd.exe 的 8K 命令行长度限制，避免长消息被截断。
  */
 export function resolveOpenClawInvocation(cliArgs = []) {
   const bin = configuredBin()
@@ -87,6 +125,13 @@ export function resolveOpenClawInvocation(cliArgs = []) {
   }
   if (IS_WIN && lower.endsWith('.ps1')) {
     return { command: 'powershell.exe', args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', bin, ...cliArgs] }
+  }
+  if (IS_WIN) {
+    // 尝试找到 .mjs 文件直接跑，绕过 cmd.exe 的 8K 命令行限制
+    const mjs = resolveWin32MjsPath(bin)
+    if (mjs) {
+      return { command: process.execPath, args: [mjs, ...cliArgs] }
+    }
   }
   return { command: bin, args: cliArgs }
 }
@@ -106,24 +151,13 @@ export function spawnSyncOpenClaw(cliArgs, options = {}) {
 }
 
 /**
- * 跨平台 shell 安全引号：将字符串用单引号包裹，并对内部的单引号做转义
+ * 通过文件传递消息启动 OpenClaw Agent（跨平台，无 shell 转义）
  *
- * Unix 单引号规则：' → '\''（结束当前单引号 + 转义引号 + 重新开始单引号）
- * PowerShell 单引号规则：' → ''（双写单引号）
- * 此处使用 Unix 规则，PowerShell 场景下被包裹在 "..." 内，.Command 参数本身不经过 cmd.exe
- */
-function shQuote(val) {
-  return `'${String(val).replace(/'/g, "'\\''")}'`
-}
-
-/**
- * 通过文件传递消息启动 OpenClaw Agent（跨平台 shell 安全版）
+ * 原理：将 message 写入临时文件后，Node.js 读取文件内容，通过 spawn 的 args 数组
+ * 直接作为 --message 参数值传入。不走 shell 命令替换，没有 shell 转义/编码问题。
  *
- * 原理：将 message 写入文件，再通过 shell 命令替换读取为 --message 参数值。
- * 完全避免 shell 对换行符和特殊字符的转义问题。
- *
- * Linux/macOS (sh):    ... --message "$(cat /path/file)"
- * Windows (PowerShell): ... --message (Get-Content /path/file -Raw)
+ * Windows 上通过 resolveOpenClawInvocation 自动绕过 cmd.exe（走 node.exe + .mjs），
+ * 避免 CMD 的 8K 命令行截断和 ANSI 编码导致的乱码。
  *
  * @param {string} cliName - Agent CLI 名称（sanitized）
  * @param {string} sessionKey - 会话唯一 Key
@@ -139,7 +173,7 @@ export function spawnAgentWithMessage(cliName, sessionKey, options = {}) {
   let { msgFile } = options
   let tempDir = null
 
-  // 没有 msgFile 则写入临时文件，调用方负责通过 cleanup 清理
+  // 没有 msgFile 则写入临时文件，调用方通过 cleanup() 清理
   if (!msgFile) {
     if (!message) throw new Error('spawnAgentWithMessage: 必须提供 message 或 msgFile')
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bcenter-msg-'))
@@ -147,32 +181,16 @@ export function spawnAgentWithMessage(cliName, sessionKey, options = {}) {
     fs.writeFileSync(msgFile, message, 'utf-8')
   }
 
-  // 通过 resolveOpenClawInvocation 解析出正确的 command+args（处理 .mjs / .ps1）
-  const allArgs = ['agent', '--agent', cliName, '--session-key', sessionKey, ...extraArgs]
-  const { command, args } = resolveOpenClawInvocation(allArgs)
-  const opts = defaultSpawnOptions(spawnOptions)
-
-  // 安全引用所有动态值
-  const qCmd = shQuote(command)
-  const qArgs = args.map(shQuote).join(' ')
-  const qFile = shQuote(msgFile)
+  // 读取文件内容，通过 spawn args 直接传递 — 无 shell 参与，无转义/编码问题
+  const msgContent = fs.readFileSync(msgFile, 'utf-8')
+  const allArgs = ['agent', '--agent', cliName, '--session-key', sessionKey, '--message', msgContent, ...extraArgs]
 
   /** 如果创建了临时目录，调用此函数清理 */
   const cleanup = tempDir
     ? () => { try { fs.rmSync(tempDir, { recursive: true, force: true }) } catch {} }
     : () => {}
 
-  if (IS_WIN) {
-    // Windows：通过 PowerShell 的 Get-Content -Raw 一次性读取整个文件内容
-    // 注意：& 后的命令放在双引号外，PowerShell 将 (Get-Content ... -Raw) 作为表达式求值
-    const psCmd = `& ${qCmd} ${qArgs} --message (Get-Content ${qFile} -Raw)`
-    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCmd], opts)
-    return { child, cleanup, msgFile }
-  }
-
-  // Unix：通过 sh -c + $(cat) 读取文件，双引号确保多行文本作为一个参数
-  const shCmd = `${qCmd} ${qArgs} --message "$(cat ${qFile})"`
-  const child = spawn('sh', ['-c', shCmd], opts)
+  const child = spawnOpenClaw(allArgs, spawnOptions)
   return { child, cleanup, msgFile }
 }
 
