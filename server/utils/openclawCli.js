@@ -76,34 +76,60 @@ function defaultSpawnOptions(extra = {}) {
 }
 
 /**
- * Windows 上从 npm 全局安装目录找到 openclaw.mjs 的绝对路径
- * 返回 null 表示未找到，由调用方降级走 cmd.exe
+ * Windows 上查找 openclaw.mjs 的绝对路径
+ *
+ * 策略：
+ * 1. bin 本身是 .mjs → 直接返回
+ * 2. bin 是绝对路径的 .cmd/.bat → 同级 node_modules/openclaw/openclaw.mjs
+ * 3. 用 where 命令在 PATH 中定位实际二进制 → 推导 mjs
+ * 4. 常见 npm 全局安装目录（%APPDATA%、%LOCALAPPDATA%）
+ * 5. 当前工作目录 node_modules
+ *
+ * 返回 null 表示未找到，由调用方降级。
  */
 function resolveWin32MjsPath(bin) {
   if (!IS_WIN) return null
 
-  // bin 本身已是 .mjs
   const lower = bin.toLowerCase()
-  if (lower.endsWith('.mjs')) {
-    if (fs.existsSync(bin)) return bin
-    return null
-  }
-  if (path.isAbsolute(bin) && lower.endsWith('.cmd') && fs.existsSync(bin)) {
-    // bin 是 .cmd 绝对路径，如 C:\Users\xxx\AppData\Roaming\npm\openclaw.cmd
-    // 同目录 node_modules/openclaw/openclaw.mjs
-    const mjs = path.join(path.dirname(bin), 'node_modules', 'openclaw', 'openclaw.mjs')
+
+  // 1. bin 本身已是 .mjs
+  if (lower.endsWith('.mjs') && fs.existsSync(bin)) return bin
+
+  // 2. bin 是绝对路径的 .cmd/.bat
+  if (path.isAbsolute(bin) && fs.existsSync(bin)) {
+    const dir = path.dirname(bin)
+    const mjs = path.join(dir, 'node_modules', 'openclaw', 'openclaw.mjs')
     if (fs.existsSync(mjs)) return mjs
   }
 
-  // 在 %APPDATA%\npm 下查找
-  const appData = process.env.APPDATA
-  if (appData) {
-    const npmDir = path.join(appData, 'npm')
+  // 3. 用 where 命令定位实际二进制（精准可靠）
+  try {
+    const where = spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/c', 'where', bin], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf-8',
+      timeout: 5000
+    })
+    if (where.status === 0 && where.stdout) {
+      // where 可能返回多行，取第一个
+      const actualPath = where.stdout.trim().split(/\r?\n/)[0]?.trim()
+      if (actualPath && fs.existsSync(actualPath)) {
+        const dir = path.dirname(actualPath)
+        const mjs = path.join(dir, 'node_modules', 'openclaw', 'openclaw.mjs')
+        if (fs.existsSync(mjs)) return mjs
+      }
+    }
+  } catch { /* ignore, fall through */ }
+
+  // 4. 常见 npm 全局安装目录
+  const npmDirs = []
+  if (process.env.APPDATA) npmDirs.push(path.join(process.env.APPDATA, 'npm'))
+  if (process.env.LOCALAPPDATA) npmDirs.push(path.join(process.env.LOCALAPPDATA, 'npm'))
+  for (const npmDir of npmDirs) {
     const mjs = path.join(npmDir, 'node_modules', 'openclaw', 'openclaw.mjs')
     if (fs.existsSync(mjs)) return mjs
   }
 
-  // 当前工作目录下的 node_modules
+  // 5. 当前工作目录下的 node_modules
   const localMjs = path.join(process.cwd(), 'node_modules', 'openclaw', 'openclaw.mjs')
   if (fs.existsSync(localMjs)) return localMjs
 
@@ -127,11 +153,12 @@ export function resolveOpenClawInvocation(cliArgs = []) {
     return { command: 'powershell.exe', args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', bin, ...cliArgs] }
   }
   if (IS_WIN) {
-    // 尝试找到 .mjs 文件直接跑，绕过 cmd.exe 的 8K 命令行限制
+    // 优先：找到 .mjs 文件直接跑，绕过 cmd.exe 的 8K 命令行限制
     const mjs = resolveWin32MjsPath(bin)
     if (mjs) {
       return { command: process.execPath, args: [mjs, ...cliArgs] }
     }
+    console.warn(`[openclawCli] Windows 未找到 openclaw.mjs（bin=${bin}），回退到 cmd.exe 可能导致长消息截断`)
   }
   return { command: bin, args: cliArgs }
 }
