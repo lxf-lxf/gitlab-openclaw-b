@@ -12,6 +12,9 @@ const GITLAB_TOOLS_SRC = path.resolve(__dirname, '../plugins/gitlab-tools.js')
 const GITLAB_TOOLS_MANIFEST = path.resolve(__dirname, '../plugins/openclaw.plugin.json')
 const GITLAB_PLUGIN_ID = 'gitlab-tools'
 
+/** 长消息包装脚本路径（绕过 Windows 命令行长度限制） */
+const AGENT_RUNNER_PATH = path.resolve(__dirname, 'openclaw-agent-runner.mjs')
+
 /** 将 gitlab-tools 插件以 OpenClaw 可识别格式部署到 agentDir/plugins/<id>/ */
 export function syncGitlabToolsPlugin(agentDir) {
   const pluginDir = path.join(agentDir, 'plugins', GITLAB_PLUGIN_ID)
@@ -80,9 +83,9 @@ function defaultSpawnOptions(extra = {}) {
  *
  * 策略：
  * 1. bin 本身是 .mjs → 直接返回
- * 2. bin 是绝对路径的 .cmd/.bat → 同级 node_modules/openclaw/openclaw.mjs
- * 3. 用 where 命令在 PATH 中定位实际二进制 → 推导 mjs
- * 4. 常见 npm 全局安装目录（%APPDATA%、%LOCALAPPDATA%）
+ * 2. bin 是绝对路径的 .cmd/.bat → 同级 node_modules 或解析 CMD 内容提取 mjs 路径
+ * 3. 用 where 命令在 PATH 中定位实际二进制 → 推导 mjs 或解析 CMD 内容
+ * 4. 常见包管理器全局安装目录（npm、pnpm）
  * 5. 当前工作目录 node_modules
  *
  * 返回 null 表示未找到，由调用方降级。
@@ -100,6 +103,16 @@ function resolveWin32MjsPath(bin) {
     const dir = path.dirname(bin)
     const mjs = path.join(dir, 'node_modules', 'openclaw', 'openclaw.mjs')
     if (fs.existsSync(mjs)) return mjs
+
+    // pnpm 等包管理器的 .CMD 包装器内嵌 mjs 绝对路径，解析提取
+    try {
+      const cmdContent = fs.readFileSync(bin, 'utf-8')
+      const match = cmdContent.match(/node\s+"%~dp0\\([^"]+\\openclaw\.mjs)"/i)
+      if (match) {
+        const mjsFromCmd = path.join(dir, match[1].replace(/\\/g, path.sep))
+        if (fs.existsSync(mjsFromCmd)) return mjsFromCmd
+      }
+    } catch { /* ignore, fall through */ }
   }
 
   // 3. 用 where 命令定位实际二进制（精准可靠）
@@ -110,29 +123,72 @@ function resolveWin32MjsPath(bin) {
       timeout: 5000
     })
     if (where.status === 0 && where.stdout) {
-      // where 可能返回多行，取第一个
       const actualPath = where.stdout.trim().split(/\r?\n/)[0]?.trim()
       if (actualPath && fs.existsSync(actualPath)) {
         const dir = path.dirname(actualPath)
         const mjs = path.join(dir, 'node_modules', 'openclaw', 'openclaw.mjs')
         if (fs.existsSync(mjs)) return mjs
+
+        // .cmd/.bat 包装器解析内嵌 mjs 路径
+        const actualLower = actualPath.toLowerCase()
+        if (actualLower.endsWith('.cmd') || actualLower.endsWith('.bat')) {
+          try {
+            const cmdContent = fs.readFileSync(actualPath, 'utf-8')
+            const match = cmdContent.match(/node\s+"%~dp0\\([^"]+\\openclaw\.mjs)"/i)
+            if (match) {
+              const mjsFromCmd = path.join(dir, match[1].replace(/\\/g, path.sep))
+              if (fs.existsSync(mjsFromCmd)) return mjsFromCmd
+            }
+          } catch { /* ignore */ }
+        }
       }
     }
   } catch { /* ignore, fall through */ }
 
-  // 4. 常见 npm 全局安装目录
+  // 4. 常见包管理器全局安装目录（npm、pnpm）
   const npmDirs = []
   if (process.env.APPDATA) npmDirs.push(path.join(process.env.APPDATA, 'npm'))
-  if (process.env.LOCALAPPDATA) npmDirs.push(path.join(process.env.LOCALAPPDATA, 'npm'))
+  if (process.env.LOCALAPPDATA) {
+    npmDirs.push(path.join(process.env.LOCALAPPDATA, 'npm'))
+    npmDirs.push(path.join(process.env.LOCALAPPDATA, 'pnpm'))  // pnpm 全局目录
+  }
   for (const npmDir of npmDirs) {
     const mjs = path.join(npmDir, 'node_modules', 'openclaw', 'openclaw.mjs')
     if (fs.existsSync(mjs)) return mjs
+
+    // pnpm 全局目录结构: global/5/.pnpm/openclaw@<version>/node_modules/openclaw/openclaw.mjs
+    try {
+      const globalDir = path.join(npmDir, 'global')
+      if (fs.existsSync(globalDir)) {
+        for (const ver of fs.readdirSync(globalDir)) {
+          const pnpmStore = path.join(globalDir, ver, '.pnpm')
+          if (!fs.existsSync(pnpmStore)) continue
+          for (const entry of fs.readdirSync(pnpmStore)) {
+            if (!entry.startsWith('openclaw@')) continue
+            const candidate = path.join(pnpmStore, entry, 'node_modules', 'openclaw', 'openclaw.mjs')
+            if (fs.existsSync(candidate)) return candidate
+          }
+        }
+      }
+    } catch { /* ignore */ }
   }
 
   // 5. 当前工作目录下的 node_modules
   const localMjs = path.join(process.cwd(), 'node_modules', 'openclaw', 'openclaw.mjs')
   if (fs.existsSync(localMjs)) return localMjs
 
+  return null
+}
+
+/**
+ * 查找 openclaw.mjs 的绝对路径（跨平台）
+ * @returns {string|null} mjs 路径，未找到返回 null
+ */
+function resolveOpenClawMjsPath() {
+  const bin = configuredBin()
+  const lower = bin.toLowerCase()
+  if (lower.endsWith('.mjs') && fs.existsSync(bin)) return bin
+  if (IS_WIN) return resolveWin32MjsPath(bin)
   return null
 }
 
@@ -146,18 +202,17 @@ export function resolveOpenClawInvocation(cliArgs = []) {
   const bin = configuredBin()
   const lower = bin.toLowerCase()
 
-  if (lower.endsWith('.mjs') && fs.existsSync(bin)) {
-    return { command: process.execPath, args: [bin, ...cliArgs] }
-  }
   if (IS_WIN && lower.endsWith('.ps1')) {
     return { command: 'powershell.exe', args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', bin, ...cliArgs] }
   }
+
+  // 优先：找到 .mjs 文件直接跑，绕过 cmd.exe 的 8K 命令行限制
+  const mjs = resolveOpenClawMjsPath()
+  if (mjs) {
+    return { command: process.execPath, args: [mjs, ...cliArgs] }
+  }
+
   if (IS_WIN) {
-    // 优先：找到 .mjs 文件直接跑，绕过 cmd.exe 的 8K 命令行限制
-    const mjs = resolveWin32MjsPath(bin)
-    if (mjs) {
-      return { command: process.execPath, args: [mjs, ...cliArgs] }
-    }
     console.warn(`[openclawCli] Windows 未找到 openclaw.mjs（bin=${bin}），回退到 cmd.exe 可能导致长消息截断`)
   }
   return { command: bin, args: cliArgs }
@@ -186,6 +241,9 @@ export function spawnSyncOpenClaw(cliArgs, options = {}) {
  * Windows 上通过 resolveOpenClawInvocation 自动绕过 cmd.exe（走 node.exe + .mjs），
  * 避免 CMD 的 8K 命令行截断和 ANSI 编码导致的乱码。
  *
+ * 当消息超长时使用 openclaw-agent-runner.mjs 包装脚本通过文件传递，
+ * 完全绕过命令行长度限制（CreateProcess ~32K）。
+ *
  * @param {string} cliName - Agent CLI 名称（sanitized）
  * @param {string} sessionKey - 会话唯一 Key
  * @param {object} [options]
@@ -208,7 +266,6 @@ export function spawnAgentWithMessage(cliName, sessionKey, options = {}) {
     fs.writeFileSync(msgFile, message, 'utf-8')
   }
 
-  // 读取文件内容，通过 spawn args 直接传递 — 无 shell 参与，无转义/编码问题
   const msgContent = fs.readFileSync(msgFile, 'utf-8')
   const allArgs = ['agent', '--agent', cliName, '--session-key', sessionKey, '--message', msgContent, ...extraArgs]
 
@@ -216,6 +273,29 @@ export function spawnAgentWithMessage(cliName, sessionKey, options = {}) {
   const cleanup = tempDir
     ? () => { try { fs.rmSync(tempDir, { recursive: true, force: true }) } catch {} }
     : () => {}
+
+  // 估算命令行总长度，正确计算中文等多字节字符
+  const estimatedLen = allArgs.reduce((sum, a) => sum + Buffer.byteLength(a, 'utf-8') + 1, 0)
+  const CMD_LEN_THRESHOLD = 4000  // cmd.exe 8K / CreateProcess 32K，取保守值
+
+  // Windows 长消息：通过包装脚本从文件读取，绕过命令行长度限制
+  if (IS_WIN && estimatedLen > CMD_LEN_THRESHOLD) {
+    const mjsPath = resolveOpenClawMjsPath()
+    if (mjsPath && fs.existsSync(AGENT_RUNNER_PATH)) {
+      const runnerArgs = [
+        '--message-file', msgFile,
+        '--',
+        mjsPath,
+        'agent', '--agent', cliName, '--session-key', sessionKey,
+        '--message', '__OPENCLAW_MSG_PLACEHOLDER__',
+        ...extraArgs
+      ]
+      console.log(`[openclawCli] 长消息 (${estimatedLen} bytes)，使用包装脚本绕过 Windows 命令行限制`)
+      const child = spawn(process.execPath, [AGENT_RUNNER_PATH, ...runnerArgs], defaultSpawnOptions(spawnOptions))
+      return { child, cleanup, msgFile }
+    }
+    console.warn(`[openclawCli] 长消息 (${estimatedLen} bytes) 但无法使用包装脚本，直接调用可能截断`)
+  }
 
   const child = spawnOpenClaw(allArgs, spawnOptions)
   return { child, cleanup, msgFile }
