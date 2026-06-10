@@ -1,0 +1,5 @@
+# Verdaccio 私服（复制为 .npmrc 后按需填写 token）
+registry=http://172.16.3.201:4873/
+
+# 若已 npm login，可手动写入 token（勿提交到 Git）
+# //172.16.3.201:4873/:_authToken=xxxxxxxx
