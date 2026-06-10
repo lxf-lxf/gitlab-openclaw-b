@@ -6,20 +6,70 @@ import SessionMessage from '../db/models/sessionMessage.js'
 import Project from '../db/models/project.js'
 import WebhookEvent from '../db/models/webhookEvent.js'
 import { eventDescription, eventSourceUrl, eventTitle } from '../utils/eventFormat.js'
-import { recoverSessionFromLog } from '../utils/openclawSession.js'
+import {
+  recoverSessionFromLog,
+  resolveOpenClawSessionFromStore,
+  resolveOpenClawSessionById,
+  resolveOpenClawSessionFromStoreByIid,
+  resolveSessionReadableFile
+} from '../utils/openclawSession.js'
+import { detectSessionContentFormat, parseTrajectoryContent } from '../utils/openclawTrajectory.js'
 
 const router = new Router()
 
-async function ensureOpenClawSessionMeta(session) {
-  if (session.openclaw_session_id && session.openclaw_session_file) return session
-  if (!session.log_file) return session
+function sanitizeAgentCliName(name) {
+  return (name || '').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'agent'
+}
 
-  const recovered = recoverSessionFromLog(session.log_file)
+async function ensureOpenClawSessionMeta(session) {
+  const cliName = sanitizeAgentCliName(session.agent_name)
+  if (session.openclaw_session_id) {
+    const readable = resolveSessionReadableFile(cliName, {
+      sessionId: session.openclaw_session_id,
+      sessionFile: session.openclaw_session_file
+    })
+    if (readable?.path && fs.existsSync(readable.path)) {
+      if (session.openclaw_session_file !== readable.path) {
+        await session.update({
+          openclaw_session_id: session.openclaw_session_id,
+          openclaw_session_file: readable.path
+        })
+      }
+      return session
+    }
+  }
+
+  const sessionKey = session.openclaw_session_key || null
+  let recovered = null
+
+  if (session.log_file) {
+    recovered = recoverSessionFromLog(session.log_file, { cliName, sessionKey })
+  }
+
+  if (!recovered?.sessionId && sessionKey) {
+    recovered = resolveOpenClawSessionFromStore(cliName, sessionKey)
+  }
+
+  if (!recovered?.sessionId && session.event_id) {
+    const event = await WebhookEvent.findByPk(session.event_id, { attributes: ['payload'] })
+    const iid = event?.payload?.object_attributes?.iid
+      ?? event?.payload?.issue?.iid
+      ?? event?.payload?.merge_request?.iid
+    if (iid != null) {
+      const startedAtMs = session.started_at ? new Date(session.started_at).getTime() : 0
+      recovered = resolveOpenClawSessionFromStoreByIid(cliName, String(iid), startedAtMs)
+    }
+  }
+
+  if (!recovered?.sessionId && session.openclaw_session_id) {
+    recovered = resolveOpenClawSessionById(cliName, session.openclaw_session_id)
+  }
+
   if (!recovered?.sessionId) return session
 
   await session.update({
     openclaw_session_id: recovered.sessionId,
-    openclaw_session_file: recovered.sessionFile
+    openclaw_session_file: recovered.sessionFile || session.openclaw_session_file
   })
   return session
 }
@@ -310,18 +360,48 @@ router.get('/:id/openclaw-messages', async ctx => {
     let session = await AgentSession.findByPk(ctx.params.id)
     if (!session) { ctx.status = 404; ctx.body = { error: 'Session not found' }; return }
     session = await ensureOpenClawSessionMeta(session)
-    if (!session.openclaw_session_file) {
-      ctx.body = { messages: [], session_id: null, session_meta: null, model: null, thinking_level: null, stats: null }
+    if (!session.openclaw_session_id && !session.openclaw_session_file) {
+      ctx.body = {
+        messages: [],
+        session_id: null,
+        session_meta: null,
+        model: null,
+        thinking_level: null,
+        stats: null,
+        error: '此会话没有关联 OpenClaw 数据'
+      }
       return
     }
 
-    const filePath = session.openclaw_session_file
-    if (!fs.existsSync(filePath)) {
+    const cliName = sanitizeAgentCliName(session.agent_name)
+    const readable = resolveSessionReadableFile(cliName, {
+      sessionId: session.openclaw_session_id,
+      sessionFile: session.openclaw_session_file
+    })
+    const filePath = readable?.path || session.openclaw_session_file
+    if (!filePath || !fs.existsSync(filePath)) {
       ctx.body = { messages: [], session_id: session.openclaw_session_id, file: filePath, error: 'File not found' }
       return
     }
 
+    if (session.openclaw_session_file !== filePath) {
+      await session.update({ openclaw_session_file: filePath })
+    }
+
     const content = fs.readFileSync(filePath, 'utf-8')
+    const contentFormat = detectSessionContentFormat(content, filePath)
+
+    if (contentFormat === 'trajectory') {
+      const parsed = parseTrajectoryContent(content)
+      ctx.body = {
+        session_id: session.openclaw_session_id,
+        file: filePath,
+        format: 'trajectory',
+        ...parsed
+      }
+      return
+    }
+
     const messages = []
     const sessionMeta = {}
     let modelInfo = null

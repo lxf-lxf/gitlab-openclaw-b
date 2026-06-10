@@ -377,7 +377,7 @@ async function start() {
 
   // 从日志回填缺失的 OpenClaw 会话 ID
   try {
-    const { recoverSessionFromLog } = await import('./utils/openclawSession.js')
+    const { recoverSessionFromLog, resolveOpenClawSessionFromStore } = await import('./utils/openclawSession.js')
     const missing = await AgentSession.findAll({
       where: {
         [Op.or]: [
@@ -390,7 +390,11 @@ async function start() {
     })
     let recovered = 0
     for (const s of missing) {
-      const meta = recoverSessionFromLog(s.log_file)
+      const cliName = (s.agent_name || '').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'agent'
+      let meta = recoverSessionFromLog(s.log_file, { cliName, sessionKey: s.openclaw_session_key })
+      if (!meta?.sessionId && s.openclaw_session_key) {
+        meta = resolveOpenClawSessionFromStore(cliName, s.openclaw_session_key)
+      }
       if (!meta?.sessionId) continue
       await s.update({
         openclaw_session_id: meta.sessionId,

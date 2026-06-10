@@ -37,6 +37,7 @@ const FIELDS = [
       { key: 'REDIS_HOST', label: 'Redis 地址', default: '127.0.0.1' },
       { key: 'REDIS_PORT', label: 'Redis 端口', default: '6379' },
       { key: 'REDIS_PASSWORD', label: 'Redis 密码（无则回车）', default: '' },
+      { key: 'REDIS_DB', label: 'Redis 逻辑库 (0-15)', default: '0' },
       { key: 'REDIS_KEY_PREFIX', label: 'Redis 键前缀', default: 'bcenter:' }
     ]
   },

@@ -218,19 +218,23 @@ onMounted(async () => {
 })
 
 async function fetchOcData() {
-  if (!session.value?.openclaw_session_id) {
-    ocError.value = '此会话没有关联 OpenClaw 数据'
-    return
-  }
-  ocLoading.value = true; ocError.value = ''
+  ocLoading.value = true
+  ocError.value = ''
   try {
     const { data } = await api.getOpenClawSessionMessages(Number(route.params.id))
+    if (data.session_id && session.value) {
+      session.value.openclaw_session_id = data.session_id
+    }
     ocMessages.value = data.messages || []
     ocMeta.value = data.session_meta || { session_id: data.session_id }
     ocModel.value = data.model || null
     ocThinking.value = data.thinking_level || null
     ocStats.value = data.stats || null
-    if (!data.messages?.length && data.error) ocError.value = data.error
+    if (!data.session_id && !data.messages?.length) {
+      ocError.value = data.error || '此会话没有关联 OpenClaw 数据'
+    } else if (!data.messages?.length && data.error) {
+      ocError.value = data.error
+    }
     scrollToBottom()
   } catch (err: any) {
     ocError.value = err?.response?.data?.error || '加载失败'

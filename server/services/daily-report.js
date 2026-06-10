@@ -2,7 +2,7 @@ import { Op } from 'sequelize'
 import AdminConfig from '../db/models/adminConfig.js'
 import DailyReport from '../db/models/dailyReport.js'
 import config from '../config.js'
-import { spawnOpenClaw } from '../utils/openclawCli.js'
+import { spawnAgentWithMessage } from '../utils/openclawCli.js'
 
 let reportTimer = null
 let running = false
@@ -182,17 +182,19 @@ function callSystemAgent(rawData) {
       '6. **不要写"根据提供的数据"这类话**, 直接书写报告正文'
     ].join('\n')
 
-    const child = spawnOpenClaw([
-      'agent', '--agent', SYSTEM_AGENT_NAME,
-      '--session-key', `daily-report-${rawData.date}-${Date.now()}`,
-      '--message', prompt,
-      '--json',
-      '--timeout', '120'
-    ], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, GITLAB_WEBHOOK_DISABLED: '1' },
-      timeout: AGENT_TIMEOUT
-    })
+    // 通过文件传递消息，避免命令行换行/长度问题
+    const sessionKey = `daily-report-${rawData.date}-${Date.now()}`
+    const { child, cleanup } = spawnAgentWithMessage(
+      SYSTEM_AGENT_NAME, sessionKey,
+      {
+        message: prompt,
+        extraArgs: ['--json', '--timeout', '120'],
+        spawnOptions: {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: { ...process.env, GITLAB_WEBHOOK_DISABLED: '1' },
+          timeout: AGENT_TIMEOUT
+        }
+      })
 
     let stdout = ''
     let stderr = ''
@@ -201,11 +203,13 @@ function callSystemAgent(rawData) {
     child.stderr.on('data', chunk => { stderr += chunk.toString() })
 
     child.on('error', err => {
+      cleanup()
       console.warn('Daily report: system agent call failed (error):', err.message.slice(0, 100))
       resolve(null)
     })
 
     child.on('exit', code => {
+      cleanup()
       if (code !== 0) {
         console.warn(`Daily report: system agent exit code ${code}:`, stderr.trim().slice(0, 200))
         resolve(null)

@@ -1,6 +1,3 @@
-import fs from 'node:fs'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import AgentSession from '../db/models/agentSession.js'
 import SessionMessage from '../db/models/sessionMessage.js'
 import WebhookEvent from '../db/models/webhookEvent.js'
@@ -8,31 +5,23 @@ import Project from '../db/models/project.js'
 import AgentTemplate from '../db/models/agentTemplate.js'
 import WebhookConfig from '../db/models/webhookConfig.js'
 import AdminConfig from '../db/models/adminConfig.js'
-import { parseOpenClawStdout } from '../utils/openclawSession.js'
+import { resolveOpenClawSessionMeta, resolveOpenClawSessionFromStore } from '../utils/openclawSession.js'
 import { eventDescription, eventSourceUrl, eventSourceLabel } from '../utils/eventFormat.js'
 import config from '../config.js'
-import { spawnOpenClaw } from '../utils/openclawCli.js'
+import { spawnOpenClaw, spawnAgentWithMessage, buildAgentLogFile, writeAgentLogFile, prepareAgentRuntime } from '../utils/openclawCli.js'
 import { scheduleDashboardBroadcast } from './notification-ws.js'
 import { notifyFlowFailure, markEventFailed } from './webhook-flow-notify.js'
-
-const OPENCLAW_AGENTS_DIR = config.openclaw.agentsDir
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const GITLAB_TOOLS_SRC = path.resolve(__dirname, '../plugins/gitlab-tools.js')
 
 function sanitizeAgentName(name) {
   return name.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'agent'
 }
 
 /** 每次调度前同步最新 gitlab-tools 插件到 Agent 目录 */
-function syncGitlabToolsPlugin(cliName) {
-  if (!fs.existsSync(GITLAB_TOOLS_SRC)) return
-  const pluginsDir = path.join(OPENCLAW_AGENTS_DIR, sanitizeAgentName(cliName), 'agent', 'plugins')
-  fs.mkdirSync(pluginsDir, { recursive: true })
-  fs.copyFileSync(GITLAB_TOOLS_SRC, path.join(pluginsDir, 'gitlab-tools.js'))
-}
-
-function buildGitlabSpawnEnv({ projectPath, gitlabId, issueIid }) {
+function buildGitlabSpawnEnv({ projectPath, gitlabId, issueIid, workspace }) {
   const env = { ...process.env, GITLAB_WEBHOOK_DISABLED: '1' }
+  if (workspace) {
+    env.OPENCLAW_WORKSPACE_DIR = workspace
+  }
   if (projectPath && !projectPath.startsWith('project#')) {
     env.BCENTER_GITLAB_PROJECT_PATH = projectPath
   }
@@ -43,6 +32,91 @@ function buildGitlabSpawnEnv({ projectPath, gitlabId, issueIid }) {
     env.BCENTER_ISSUE_IID = String(issueIid)
   }
   return env
+}
+
+/**
+ * 按 GitLab 事件类型构建丰富的事件上下文，用于 Agent 消息
+ */
+function buildEventContext(event, ev) {
+  const lines = [`- **项目**: ${ev.project_path || '-'}`]
+  lines.push(`- **事件类型**: ${event.event_type}`)
+  lines.push(`- **操作**: ${ev.action || '-'}`)
+
+  if (ev.iid) lines.push(`- **ID**: #${ev.iid}`)
+  if (ev.title) lines.push(`- **标题**: ${ev.title}`)
+  if (ev.state) lines.push(`- **状态**: ${ev.state}`)
+  if (ev.labels) lines.push(`- **标签**: ${ev.labels}`)
+  if (ev.user) lines.push(`- **触发用户**: @${ev.user}`)
+
+  switch (event.event_type) {
+    case 'Issue Hook': {
+      if (ev.description) lines.push(`- **描述**: ${ev.description}`)
+      if (ev.milestone) lines.push(`- **里程碑**: ${ev.milestone}`)
+      if (ev.milestoneAssigned) lines.push('- **里程碑变更**: 已指派里程碑')
+      break
+    }
+    case 'Merge Request Hook': {
+      if (ev.description) lines.push(`- **描述**: ${ev.description}`)
+      if (ev.source_branch) lines.push(`- **源分支**: ${ev.source_branch}`)
+      if (ev.target_branch) lines.push(`- **目标分支**: ${ev.target_branch}`)
+      if (ev.merge_status) lines.push(`- **合并状态**: ${ev.merge_status}`)
+      if (ev.milestone) lines.push(`- **里程碑**: ${ev.milestone}`)
+      if (ev.milestoneAssigned) lines.push('- **里程碑变更**: 已指派里程碑')
+      break
+    }
+    case 'Note Hook': {
+      if (ev.noteable_type) lines.push(`- **评论对象**: ${ev.noteable_type}`)
+      if (ev.iid) lines.push(`- **关联 #**: ${ev.iid}`)
+      if (ev.title) lines.push(`- **标题**: ${ev.title}`)
+      if (ev.comment) lines.push(`- **评论内容**: ${ev.comment}`)
+      break
+    }
+    case 'Push Hook': {
+      lines.push(`- **分支**: ${ev.ref || '-'}`)
+      lines.push(`- **提交数**: ${ev.total_commits_count || 0}`)
+      if (ev.before) lines.push(`- **前 SHA**: ${ev.before.slice(0, 8)}`)
+      if (ev.after) lines.push(`- **后 SHA**: ${ev.after.slice(0, 8)}`)
+      if (ev.commits?.length) {
+        lines.push('', '### 提交记录')
+        for (const c of ev.commits.slice(0, 10)) {
+          lines.push(`- \`${c.id}\` ${c.message}${c.author ? ` · ${c.author}` : ''}`)
+        }
+        if (ev.commits.length > 10) lines.push(`- ... 共 ${ev.commits.length} 个提交`)
+      }
+      break
+    }
+    case 'Pipeline Hook': {
+      lines.push(`- **分支**: ${ev.ref || '-'}`)
+      lines.push(`- **状态**: ${ev.pipeline_status || '-'}`)
+      if (ev.pipeline_source) lines.push(`- **触发源**: ${ev.pipeline_source}`)
+      if (ev.pipeline_duration != null) lines.push(`- **耗时**: ${Math.round(ev.pipeline_duration)}s`)
+      if (ev.source_branch) lines.push(`- **源分支**: ${ev.source_branch}`)
+      if (ev.target_branch) lines.push(`- **目标分支**: ${ev.target_branch}`)
+      break
+    }
+    case 'Job Hook': {
+      lines.push(`- **Job**: ${ev.build_name || '-'}`)
+      lines.push(`- **阶段**: ${ev.build_stage || '-'}`)
+      lines.push(`- **状态**: ${ev.build_status || '-'}`)
+      if (ev.ref) lines.push(`- **分支**: ${ev.ref}`)
+      if (ev.build_duration != null) lines.push(`- **耗时**: ${Math.round(ev.build_duration)}s`)
+      if (ev.runner_desc) lines.push(`- **Runner**: ${ev.runner_desc}`)
+      break
+    }
+    case 'Tag Push Hook': {
+      lines.push(`- **标签**: ${ev.tag_ref || '-'}`)
+      if (ev.before && ev.before !== '0000000000000000000000000000000000000000') lines.push(`- **前 SHA**: ${ev.before.slice(0, 8)}`)
+      if (ev.after && ev.after !== '0000000000000000000000000000000000000000') lines.push(`- **后 SHA**: ${ev.after.slice(0, 8)}`)
+      break
+    }
+    case 'Wiki Page Hook': {
+      if (ev.description) lines.push(`- **内容摘要**: ${ev.description}`)
+      if (ev.slug) lines.push(`- **Slug**: ${ev.slug}`)
+      break
+    }
+  }
+
+  return lines.join('\n')
 }
 
 function buildAgentDispatchNotification({ tpl, event, ev, projectPath, projectName, sessionKey, tools, executeOrder, chainFrom }) {
@@ -114,30 +188,147 @@ function buildAgentDispatchNotification({ tpl, event, ev, projectPath, projectNa
 class AgentManager {
 
   /**
-   * 提取事件信息
+   * 提取事件信息，覆盖全部 8 种 GitLab Webhook 类型
    */
   extractEvent(event) {
     const payload = event.payload || {}
     const obj = payload.object_attributes || {}
-    const noteable = payload.issue || payload.merge_request || {}
+    const p = payload // alias for brevity
     const isNote = event.event_type === 'Note Hook'
-    const rawLabels = payload.labels || obj.labels || []
-    const noteableType = isNote
-      ? (obj.noteable_type || (payload.issue ? 'Issue' : payload.merge_request ? 'MergeRequest' : ''))
-      : ''
-    return {
+
+    // 公共字段
+    const base = {
       project_path: payload.project?.path_with_namespace || '',
       eventType: event.event_type || '',
-      iid: isNote ? (noteable.iid || obj.noteable_iid) : obj.iid,
-      title: (isNote ? noteable.title : obj.title) || '',
-      state: isNote ? noteable.state : obj.state,
-      labels: (Array.isArray(rawLabels) ? rawLabels : []).map(l => l.title || l).join(','),
-      comment: isNote ? (obj.note || '').slice(0, 500) : '',
+      iid: null,
+      title: '',
+      description: '',
+      state: '',
+      labels: '',
       user: payload.user?.username || '',
       action: obj.action || event.event_action || '',
-      noteable_type: noteableType,
-      milestoneAssigned: payload.changes?.milestone_id?.current != null
+      // 通用 object_attributes 字段
+      source_branch: obj.source_branch || '',
+      target_branch: obj.target_branch || '',
+      ref: obj.ref || (p.ref || '').replace('refs/heads/', ''),
+      milestone: obj.milestone?.title || payload.milestone?.title || '',
+      milestoneAssigned: payload.changes?.milestone_id?.current != null,
+      // 评论
+      comment: '',
+      noteable_type: '',
+      // Pipeline / Job
+      pipeline_status: '',
+      pipeline_source: '',
+      pipeline_duration: null,
+      pipeline_stage: '',
+      build_name: '',
+      build_stage: '',
+      build_status: '',
+      build_duration: null,
+      runner_desc: '',
+      // MR
+      merge_status: '',
+      source_project_id: null,
+      target_project_id: null,
+      // Push
+      commits: [],
+      total_commits_count: 0,
+      before: '',
+      after: '',
+      // Tag
+      tag_ref: '',
+      // 通过 changes 判断字段变更
+      changes: payload.changes || {},
+      slug: ''
     }
+
+    const noteable = payload.issue || payload.merge_request || {}
+
+    switch (event.event_type) {
+      case 'Issue Hook': {
+        base.iid = obj.iid
+        base.title = obj.title || ''
+        base.description = (obj.description || '').slice(0, 2000)
+        base.state = obj.state || ''
+        base.labels = (Array.isArray(payload.labels || obj.labels) ? (payload.labels || obj.labels) : [])
+          .map(l => l.title || l).join(', ')
+        base.milestone = obj.milestone?.title || ''
+        break
+      }
+      case 'Merge Request Hook': {
+        base.iid = obj.iid
+        base.title = obj.title || ''
+        base.description = (obj.description || '').slice(0, 2000)
+        base.state = obj.state || ''
+        base.labels = (Array.isArray(payload.labels || obj.labels) ? (payload.labels || obj.labels) : [])
+          .map(l => l.title || l).join(', ')
+        base.source_branch = obj.source_branch || ''
+        base.target_branch = obj.target_branch || ''
+        base.merge_status = obj.merge_status || ''
+        base.source_project_id = obj.source_project_id || null
+        base.target_project_id = obj.target_project_id || null
+        base.milestone = obj.milestone?.title || ''
+        break
+      }
+      case 'Note Hook': {
+        base.iid = noteable.iid || obj.noteable_iid
+        base.title = noteable.title || ''
+        base.state = noteable.state || ''
+        base.comment = (obj.note || '').slice(0, 500)
+        base.noteable_type = obj.noteable_type || (payload.issue ? 'Issue' : payload.merge_request ? 'MergeRequest' : '')
+        base.description = (noteable.description || '').slice(0, 1000)
+        break
+      }
+      case 'Push Hook': {
+        base.ref = (p.ref || '').replace('refs/heads/', '')
+        base.before = p.before || ''
+        base.after = p.after || ''
+        base.commits = (p.commits || []).map(c => ({
+          id: (c.id || '').slice(0, 8),
+          message: (c.message || c.title || '').slice(0, 100),
+          author: c.author?.name || '',
+          timestamp: c.timestamp || ''
+        }))
+        base.total_commits_count = p.total_commits_count || base.commits.length
+        base.user = p.user_username || p.user?.username || ''
+        break
+      }
+      case 'Pipeline Hook': {
+        base.iid = obj.id
+        base.ref = (obj.ref || p.ref || '').replace('refs/heads/', '')
+        base.pipeline_status = obj.status || p.build_status || ''
+        base.pipeline_source = obj.source || ''
+        base.pipeline_duration = obj.duration || obj.queued_duration || null
+        base.user = p.user?.username || ''
+        base.source_branch = (p.merge_request?.source_branch || obj.ref || '').replace('refs/heads/', '')
+        base.target_branch = (p.merge_request?.target_branch || '').replace('refs/heads/', '')
+        break
+      }
+      case 'Job Hook': {
+        base.build_name = p.build_name || ''
+        base.build_stage = p.build_stage || ''
+        base.build_status = p.build_status || ''
+        base.build_duration = p.build_duration || null
+        base.ref = (p.ref || '').replace('refs/heads/', '')
+        base.runner_desc = p.runner?.description || ''
+        base.user = p.user?.username || ''
+        break
+      }
+      case 'Tag Push Hook': {
+        base.tag_ref = (p.ref || '').replace('refs/tags/', '')
+        base.before = p.before || ''
+        base.after = p.after || ''
+        base.user = p.user_username || p.user?.username || ''
+        break
+      }
+      case 'Wiki Page Hook': {
+        base.title = obj.title || ''
+        base.description = (obj.content || '').slice(0, 500)
+        base.slug = obj.slug || ''
+        break
+      }
+    }
+    return base
   }
 
   // ──────────────────────────────────────────────
@@ -376,26 +567,24 @@ class AgentManager {
 
     const sessionKey = `gitlab:${agentCliName}:${iid}_${ts}`
 
-    // 从模板配置构建消息
+    // 构建按事件类型区分的完整事件上下文
+    const eventCtx = buildEventContext(event, ev)
+
+    // 从模板配置构建指令部分
     const instructions = tpl.agent_config?.instructions || `# ${tpl.name}\n\n请根据指令执行任务。`
     const tools = tpl.agent_config?.tools || []
     const toolHint = tools.length
       ? `\n\n## 可用工具\n\n${tools.map(t => `- \`${t}\``).join('\n')}`
       : ''
 
-    const message = [
+    // 完整消息体：事件上下文 + 工具参数 + 指令
+    const fullMessage = [
       `# ${tpl.name} — 事件通知`,
       '',
-      `- **项目**: ${projectPath}`,
-      `- **事件类型**: ${event.event_type}`,
-      `- **操作**: ${ev.action}`,
-      ev.iid ? `- **Issue/MR #**: ${ev.iid}` : '',
-      ev.title ? `- **标题**: ${ev.title}` : '',
-      `- **当前状态**: ${ev.state}`,
-      `- **当前标签**: ${ev.labels}`,
-      `- **触发用户**: ${ev.user}`,
-      ev.comment ? `- **评论内容**: ${ev.comment}` : '',
-      ev.milestoneAssigned ? '- **里程碑**: 已指派' : '',
+      '---',
+      '## 事件上下文',
+      '',
+      eventCtx,
       ...gitlabToolCtx,
       '',
       '---',
@@ -419,11 +608,12 @@ class AgentManager {
     const { isAgentRegisteredInOpenClaw } = await import('./template-deploy.js')
     if (!isAgentRegisteredInOpenClaw(agentCliName)) {
       throw new Error(
-        `Agent「${tpl.name}」未在 OpenClaw 注册。请在 Agent 模板页点击「初始化到 OpenClaw」（需配置 OPENCLAW_DEFAULT_WORKSPACE）`
+        `Agent「${tpl.name}」未在 OpenClaw 注册。请在 Agent 模板页点击「初始化到 OpenClaw」`
       )
     }
 
-    return this._spawnOpenClaw(tpl.name, agentCliName, sessionKey, message, event, dispatchNotification, {
+    return this._spawnOpenClaw(tpl.name, agentCliName, sessionKey, fullMessage, event, dispatchNotification, {
+      template: tpl,
       projectPath: projectPath.startsWith('project#') ? null : projectPath,
       gitlabId,
       issueIid: ev.iid != null && ev.iid !== '' ? String(ev.iid) : null
@@ -446,7 +636,7 @@ class AgentManager {
    * @param {object} event - WebhookEvent 实例
    */
   async _spawnOpenClaw(displayName, cliName, sessionKey, message, event, dispatchNotification = null, spawnContext = null) {
-    const logFile = `/tmp/bcenter-agent-${cliName}-${event.id}-${Date.now()}.log`
+    const logFile = buildAgentLogFile(cliName, event.id)
     let session
     try {
       session = await AgentSession.create({
@@ -455,7 +645,8 @@ class AgentManager {
         agent_name: displayName,
         session_type: 'event',
         status: 'pending',
-        log_file: logFile
+        log_file: logFile,
+        openclaw_session_key: sessionKey
       })
     } catch (createErr) {
       console.error(`_spawnOpenClaw create session error:`, createErr.message)
@@ -501,25 +692,40 @@ class AgentManager {
           metadata: { agent_name: displayName }
         })
 
-    syncGitlabToolsPlugin(cliName)
+    const { workspace } = prepareAgentRuntime(cliName, spawnContext?.template || null)
 
-    // 移除 --local，使用 OpenClaw 云模式以节省本地内存
-    const child = spawnOpenClaw([
-      'agent', '--agent', cliName,
-      '--session-key', sessionKey,
-      '--message', message,
-      '--json',
-      '--timeout', '600'
-        ], {
+    const { child, cleanup: msgCleanup } = spawnAgentWithMessage(
+      cliName, sessionKey,
+      {
+        message,
+        extraArgs: ['--json', '--timeout', '600'],
+        spawnOptions: {
           stdio: ['ignore', 'pipe', 'pipe'],
-          env: buildGitlabSpawnEnv(spawnContext || {}),
+          env: buildGitlabSpawnEnv({ ...(spawnContext || {}), workspace }),
           timeout: 600_000
-        })
+        }
+      })
 
         let stdout = ''
         let stderr = ''
+        let ocMetaPersisted = false
 
-        child.stdout.on('data', chunk => { stdout += chunk.toString() })
+        const persistOpenClawMeta = async (meta) => {
+          if (!meta?.sessionId || ocMetaPersisted) return
+          ocMetaPersisted = true
+          await AgentSession.update({
+            openclaw_session_id: meta.sessionId,
+            openclaw_session_file: meta.sessionFile || null
+          }, { where: { id: session.id } })
+        }
+
+        child.stdout.on('data', chunk => {
+          stdout += chunk.toString()
+          if (!ocMetaPersisted) {
+            const meta = resolveOpenClawSessionMeta({ stdout, cliName, sessionKey })
+            if (meta?.sessionId) persistOpenClawMeta(meta).catch(e => console.warn('persistOpenClawMeta:', e.message))
+          }
+        })
         child.stderr.on('data', chunk => { stderr += chunk.toString() })
 
         child.on('error', async (err) => {
@@ -547,15 +753,19 @@ class AgentManager {
 
         child.on('exit', async (code) => {
           try {
-            const logDir = path.dirname(logFile)
-            fs.mkdirSync(logDir, { recursive: true })
-            fs.writeFileSync(logFile, stdout + '\n--- stderr ---\n' + stderr)
-
-            const sessionMeta = parseOpenClawStdout(stdout)
+            let sessionMeta = resolveOpenClawSessionMeta({ stdout, cliName, sessionKey })
+            if (!sessionMeta?.sessionId) {
+              sessionMeta = resolveOpenClawSessionFromStore(cliName, sessionKey)
+            }
             const openclawSessionId = sessionMeta?.sessionId || null
             const openclawSessionFile = sessionMeta?.sessionFile || null
+            if (openclawSessionId) ocMetaPersisted = true
 
-            const updateData = { finished_at: new Date(), log_file: logFile }
+            const logWritten = writeAgentLogFile(logFile, stdout, stderr)
+            const updateData = {
+              finished_at: new Date(),
+              log_file: logWritten ? logFile : null
+            }
             if (openclawSessionId) {
               updateData.openclaw_session_id = openclawSessionId
               updateData.openclaw_session_file = openclawSessionFile

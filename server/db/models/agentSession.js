@@ -12,6 +12,7 @@ const AgentSession = sequelize.define('agent_sessions', {
   started_at: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
   finished_at: { type: DataTypes.DATE },
   log_file: { type: DataTypes.STRING(500), comment: 'Agent 执行日志文件路径' },
+  openclaw_session_key: { type: DataTypes.STRING(200), comment: 'OpenClaw session-key（用于从 sessions.json 回填）' },
   openclaw_session_id: { type: DataTypes.STRING(100), comment: 'OpenClaw 真实会话 ID' },
   openclaw_session_file: { type: DataTypes.STRING(500), comment: 'OpenClaw 会话 JSONL 文件路径' },
   fail_reason: { type: DataTypes.TEXT, comment: '失败原因' }

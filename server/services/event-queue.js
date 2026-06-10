@@ -17,17 +17,18 @@ let running = false
  */
 export function initRedis() {
   if (redis) return redis
-  const { host, port, password, keyPrefix } = config.redis
+  const { host, port, password, db, keyPrefix } = config.redis
   redis = new Redis({
     host,
     port,
-    password,
+    password: password || undefined,
+    db,
     keyPrefix,
     retryStrategy: times => Math.min(times * 100, 3000),
     maxRetriesPerRequest: 3
   })
   redis.on('error', err => console.error('Redis error:', err.message))
-  redis.on('connect', () => console.log(`Redis connected (${host}:${port})`))
+  redis.on('connect', () => console.log(`Redis connected (${host}:${port}/db${db})`))
   return redis
 }
 
@@ -118,11 +119,8 @@ async function processEventDirect(eventId) {
       include: [{ model: Project, attributes: ['name', 'path_with_namespace'] }]
     })
     if (!event) {
-      const { notifyFlowFailure } = await import('./webhook-flow-notify.js')
-      await notifyFlowFailure({
-        title: '事件处理失败',
-        message: `事件 #${eventId} 不存在，无法调度 Agent`
-      })
+      // 常见于 db:reset 后 Redis 队列仍残留旧 event id，或 REDIS_DB 与历史环境不一致
+      console.warn(`Event #${eventId} not found in DB (stale queue entry?), skipping Agent dispatch`)
       return
     }
     await AgentManager.handleEvent(event)

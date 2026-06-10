@@ -57,16 +57,11 @@
           </div>
         </div>
 
-        <!-- 工作空间 -->
-        <div class="config-section ws-section" v-if="t.workspace_path">
-          <span class="config-label">工作空间：</span>
-          <code class="ws-path">{{ t.workspace_path }}</code>
-        </div>
-
-        <!-- OpenClaw 路径 -->
+        <!-- 工作空间 / Agent 目录 -->
         <div class="config-section ws-section" v-if="t.deployed">
-          <span class="config-label">Agent 路径：</span>
-          <code class="ws-path">~/.openclaw/agents/{{ t.name }}/agent/</code>
+          <span class="config-label">工作空间：</span>
+          <code class="ws-path">{{ t.workspace_path || `~/.openclaw/agents/${t.name}/agent/` }}</code>
+          <span v-if="!t.workspace_path" class="ws-hint">（默认与 AGENTS.md 同目录）</span>
         </div>
 
         <!-- 关联下游 Agent -->
@@ -232,8 +227,8 @@
               </div>
             </div>
             <div class="form-group">
-              <label class="form-label">工作空间 <span class="hint">留空使用默认</span></label>
-              <input v-model="form.workspace_path" class="form-input" placeholder="/Users/xxx/workspace" />
+              <label class="form-label">工作空间 <span class="hint">留空则使用 Agent 目录</span></label>
+              <input v-model="form.workspace_path" class="form-input" placeholder="留空 → ~/.openclaw/agents/&lt;name&gt;/agent/" />
             </div>
           </div>
 
@@ -661,6 +656,7 @@ async function deployTemplate(t: any) {
 
 .ws-section { margin-top: 4px; }
 .ws-path { font-size: 12px; font-family: monospace; color: var(--accent-blue); background: rgba(0,113,227,0.06); padding: 2px 8px; border-radius: 4px; }
+.ws-hint { font-size: 11px; color: var(--text-tertiary); margin-left: 6px; }
 
 .event-badge { font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 6px; }
 .type-mode { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; }

@@ -10,12 +10,12 @@ import { seedDefaults } from '../server/db/seed.js'
 import config from '../server/config.js'
 
 async function flushRedis() {
-  const { host, port, password, keyPrefix } = config.redis
+  const { host, port, password, db, keyPrefix } = config.redis
   if (!host) {
     console.log('→ Redis 未配置，跳过')
     return
   }
-  const redis = new Redis({ host, port, password: password || undefined })
+  const redis = new Redis({ host, port, password: password || undefined, db })
   try {
     const pattern = `${keyPrefix || 'bcenter:'}*`
     let cursor = '0'

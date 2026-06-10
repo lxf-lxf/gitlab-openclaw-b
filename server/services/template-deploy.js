@@ -1,7 +1,5 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import os from 'node:os'
-import { fileURLToPath } from 'node:url'
 import AgentTemplate from '../db/models/agentTemplate.js'
 import config from '../config.js'
 import {
@@ -9,25 +7,26 @@ import {
   ensureWorkspaceDir,
   listOpenClawAgentsSync,
   isSpawnTimedOut,
-  cliTimeoutMs
+  cliTimeoutMs,
+  syncOpenClawAgentRegistry,
+  resolveAgentDir,
+  resolveAgentRuntimeWorkspace,
+  syncAgentWorkspaceFiles,
+  syncGitlabToolsPlugin
 } from '../utils/openclawCli.js'
 import { ensureOpenClawConfigReadyForDeploy } from '../utils/openclawConfig.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const OPENCLAW_AGENTS_DIR = config.openclaw.agentsDir
-const GITLAB_TOOLS_SRC = path.resolve(__dirname, '../plugins/gitlab-tools.js')
 const MODEL_ID = config.openclaw.defaultModel
 
 function sanitizeAgentName(name) {
   return name.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'agent'
 }
 
-export function resolveDeployWorkspace(template) {
-  const fromTemplate = (template?.workspace_path || '').trim()
-  if (fromTemplate) return fromTemplate
-  const fromEnv = (config.openclaw.defaultWorkspace || '').trim()
-  if (fromEnv) return fromEnv
-  return path.join(os.homedir(), 'workspace')
+/** @deprecated 使用 resolveAgentRuntimeWorkspace */
+export function resolveDeployWorkspace(template, agentDir) {
+  const cliName = sanitizeAgentName(template?.name || 'agent')
+  return resolveAgentRuntimeWorkspace(template, cliName) || agentDir
 }
 
 export function isAgentRegisteredInOpenClaw(agentName) {
@@ -46,16 +45,14 @@ function collectChainAgentNames(template) {
  */
 export async function deployTemplateToOpenClaw(template, options = {}) {
   const agentName = sanitizeAgentName(template.name)
-  const agentDir = path.join(OPENCLAW_AGENTS_DIR, agentName, 'agent')
-  const pluginsDir = path.join(agentDir, 'plugins')
-  const workspace = resolveDeployWorkspace(template)
+  const agentDir = resolveAgentDir(agentName)
+  const workspace = resolveAgentRuntimeWorkspace(template, agentName)
 
   ensureWorkspaceDir(workspace)
-  fs.mkdirSync(pluginsDir, { recursive: true })
+  ensureWorkspaceDir(agentDir)
+  fs.mkdirSync(path.join(agentDir, 'plugins'), { recursive: true })
 
-  if (fs.existsSync(GITLAB_TOOLS_SRC)) {
-    fs.copyFileSync(GITLAB_TOOLS_SRC, path.join(pluginsDir, 'gitlab-tools.js'))
-  }
+  syncGitlabToolsPlugin(agentDir)
 
   fs.writeFileSync(path.join(agentDir, 'models.json'), JSON.stringify({ providers: {} }, null, 2))
 
@@ -69,6 +66,12 @@ export async function deployTemplateToOpenClaw(template, options = {}) {
     : ''
   const agentsMd = `# ${template.name} — ${template.description || 'Agent'}\n\n${instructions}${tools}${eventInfo}\n`
   fs.writeFileSync(path.join(agentDir, 'AGENTS.md'), agentsMd)
+  syncAgentWorkspaceFiles(agentDir, workspace)
+
+  fs.writeFileSync(
+    path.join(agentDir, 'agent.json'),
+    JSON.stringify({ id: agentName, name: agentName, workspace, agentDir }, null, 2)
+  )
 
   const configReady = ensureOpenClawConfigReadyForDeploy()
   if (!configReady.ok) {
@@ -111,9 +114,15 @@ export async function deployTemplateToOpenClaw(template, options = {}) {
       console.warn(`Agent "${agentName}" add 超时，目录已写入但未在 CLI 列表中确认`)
     } else if (!options.allowUnverified) {
       throw new Error(
-        `Agent "${agentName}" 文件已写入，但未在 OpenClaw 注册成功。请检查 OPENCLAW_DEFAULT_WORKSPACE 并执行: openclaw agents list`
+        `Agent "${agentName}" 文件已写入，但未在 OpenClaw 注册成功。请执行: openclaw agents list`
       )
     }
+  }
+
+  // 重新初始化时同步 workspace/agentDir（agents add 对已存在 Agent 可能不更新）
+  const synced = syncOpenClawAgentRegistry(agentName, { workspace, agentDir })
+  if (synced) {
+    console.log(`[template-deploy] Agent "${agentName}" workspace → ${workspace}`)
   }
 
   await template.update({ deployed: 1 })
@@ -123,7 +132,7 @@ export async function deployTemplateToOpenClaw(template, options = {}) {
     agent_dir: agentDir,
     workspace,
     registered: isAgentRegisteredInOpenClaw(agentName),
-    gitlab_tools_loaded: fs.existsSync(path.join(pluginsDir, 'gitlab-tools.js')),
+    gitlab_tools_loaded: fs.existsSync(path.join(agentDir, 'plugins', 'gitlab-tools', 'package.json')),
     message: `Agent "${template.name}" 已初始化到 OpenClaw（workspace: ${workspace}）`
   }
 }

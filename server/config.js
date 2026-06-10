@@ -44,6 +44,7 @@ const config = {
     host: env('REDIS_HOST'),
     port: envInt('REDIS_PORT', 6379),
     password: env('REDIS_PASSWORD'),
+    db: Math.min(15, Math.max(0, envInt('REDIS_DB', 0))),
     keyPrefix: env('REDIS_KEY_PREFIX') || 'bcenter:'
   },
   openclaw: {

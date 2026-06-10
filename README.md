@@ -212,7 +212,7 @@ CLI：`npx b-center init|start|stop|restart|status|fg`。详见 [docs/DEPLOY-NPM
 |------|------|
 | `PORT` | 后端端口，默认 3000 |
 | `DB_*` | MySQL 连接 |
-| `REDIS_*` | Redis 连接 |
+| `REDIS_*` | Redis 连接（`REDIS_DB` 逻辑库 0-15，多环境建议独立 db） |
 | `GITLAB_BASE_URL` | GitLab API 根地址 |
 | `WEBHOOK_BASE_URL` | Webhook 回调根地址 |
 | `OPENCLAW_BIN` | OpenClaw CLI 路径 |

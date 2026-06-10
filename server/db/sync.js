@@ -28,6 +28,15 @@ async function syncDatabase() {
       console.log('Added webhook_events.dispatch_note column.')
     }
 
+    const sessionsTable = await qi.describeTable('agent_sessions').catch(() => null)
+    if (sessionsTable && !sessionsTable.openclaw_session_key) {
+      await qi.addColumn('agent_sessions', 'openclaw_session_key', {
+        type: DataTypes.STRING(200),
+        allowNull: true
+      })
+      console.log('Added agent_sessions.openclaw_session_key column.')
+    }
+
     await dedupeWebhookConfigs()
 
     const indexes = await qi.showIndex('webhook_configs').catch(() => [])
