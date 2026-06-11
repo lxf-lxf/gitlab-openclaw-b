@@ -6,6 +6,22 @@ const sequelize = new Sequelize(config.db.database, config.db.user, config.db.pa
   port: config.db.port,
   dialect: 'mysql',
   logging: false,
+  retry: {
+    max: 3,
+    match: [
+      /SequelizeConnectionError/,
+      /SequelizeConnectionRefusedError/,
+      /SequelizeHostNotFoundError/,
+      /SequelizeHostNotReachableError/,
+      /SequelizeInvalidConnectionError/,
+      /SequelizeConnectionTimedOutError/,
+      /ETIMEDOUT/,
+      /ECONNREFUSED/
+    ]
+  },
+  dialectOptions: {
+    connectTimeout: 10000
+  },
   define: {
     timestamps: true,
     underscored: false,
@@ -13,9 +29,10 @@ const sequelize = new Sequelize(config.db.database, config.db.user, config.db.pa
   },
   pool: {
     max: 10,
-    min: 0,
-    acquire: 30000,
-    idle: 10000
+    min: 2,
+    acquire: 60000,
+    idle: 5000,
+    evict: 10000
   }
 })
 
