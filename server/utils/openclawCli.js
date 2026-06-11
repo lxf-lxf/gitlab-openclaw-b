@@ -233,16 +233,15 @@ export function spawnSyncOpenClaw(cliArgs, options = {}) {
 }
 
 /**
- * 通过文件传递消息启动 OpenClaw Agent（跨平台，无 shell 转义）
+ * 通过文件传递消息启动 OpenClaw Agent（跨平台）
  *
- * 原理：将 message 写入临时文件后，Node.js 读取文件内容，通过 spawn 的 args 数组
- * 直接作为 --message 参数值传入。不走 shell 命令替换，没有 shell 转义/编码问题。
+ * 原理：将 message 写入临时文件后，通过以下方式传递：
+ * - Unix: 读取文件内容，通过 spawn args 直接作为 --message 参数值传入
+ * - Windows: 使用包装脚本 openclaw-agent-runner.mjs 从文件读取消息，
+ *   通过 process.argv 注入并 import(openclaw.mjs) 执行
  *
- * Windows 上通过 resolveOpenClawInvocation 自动绕过 cmd.exe（走 node.exe + .mjs），
- * 避免 CMD 的 8K 命令行截断和 ANSI 编码导致的乱码。
- *
- * 当消息超长时使用 openclaw-agent-runner.mjs 包装脚本通过文件传递，
- * 完全绕过命令行长度限制（CreateProcess ~32K）。
+ * Windows 上始终走包装脚本（消息通过文件传递，完全不经过命令行参数），
+ * 彻底避免 CreateProcess 命令行编码/转义问题导致的乱码。
  *
  * @param {string} cliName - Agent CLI 名称（sanitized）
  * @param {string} sessionKey - 会话唯一 Key
@@ -266,20 +265,13 @@ export function spawnAgentWithMessage(cliName, sessionKey, options = {}) {
     fs.writeFileSync(msgFile, message, 'utf-8')
   }
 
-  const msgContent = fs.readFileSync(msgFile, 'utf-8')
-  const allArgs = ['agent', '--agent', cliName, '--session-key', sessionKey, '--message', msgContent, ...extraArgs]
-
   /** 如果创建了临时目录，调用此函数清理 */
   const cleanup = tempDir
     ? () => { try { fs.rmSync(tempDir, { recursive: true, force: true }) } catch {} }
     : () => {}
 
-  // 估算命令行总长度，正确计算中文等多字节字符
-  const estimatedLen = allArgs.reduce((sum, a) => sum + Buffer.byteLength(a, 'utf-8') + 1, 0)
-  const CMD_LEN_THRESHOLD = 4000  // cmd.exe 8K / CreateProcess 32K，取保守值
-
-  // Windows 长消息：通过包装脚本从文件读取，绕过命令行长度限制
-  if (IS_WIN && estimatedLen > CMD_LEN_THRESHOLD) {
+  // ── Windows：始终走包装脚本，消息通过文件传递，避免命令行编码问题 ──
+  if (IS_WIN) {
     const mjsPath = resolveOpenClawMjsPath()
     if (mjsPath && fs.existsSync(AGENT_RUNNER_PATH)) {
       const runnerArgs = [
@@ -290,13 +282,20 @@ export function spawnAgentWithMessage(cliName, sessionKey, options = {}) {
         '--message', '__OPENCLAW_MSG_PLACEHOLDER__',
         ...extraArgs
       ]
-      console.log(`[openclawCli] 长消息 (${estimatedLen} bytes)，使用包装脚本绕过 Windows 命令行限制`)
       const child = spawn(process.execPath, [AGENT_RUNNER_PATH, ...runnerArgs], defaultSpawnOptions(spawnOptions))
       return { child, cleanup, msgFile }
     }
-    console.warn(`[openclawCli] 长消息 (${estimatedLen} bytes) 但无法使用包装脚本，直接调用可能截断`)
+    // 降级：未找到 mjs 或 runner，回退到命令行传参（可能截断或乱码）
+    console.warn(`[openclawCli] Windows 缺少包装脚本或 mjs，消息含中文时可能出现乱码`)
+    const msgContent = fs.readFileSync(msgFile, 'utf-8')
+    const allArgs = ['agent', '--agent', cliName, '--session-key', sessionKey, '--message', msgContent, ...extraArgs]
+    const child = spawnOpenClaw(allArgs, spawnOptions)
+    return { child, cleanup, msgFile }
   }
 
+  // ── Unix：直接读取文件内容，通过 spawn args 传递（无 shell，无编码问题） ──
+  const msgContent = fs.readFileSync(msgFile, 'utf-8')
+  const allArgs = ['agent', '--agent', cliName, '--session-key', sessionKey, '--message', msgContent, ...extraArgs]
   const child = spawnOpenClaw(allArgs, spawnOptions)
   return { child, cleanup, msgFile }
 }
