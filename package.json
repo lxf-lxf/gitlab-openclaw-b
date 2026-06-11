@@ -1,6 +1,6 @@
 {
   "name": "gitlab-b-center",
-  "version": "1.0.36",
+  "version": "1.0.37",
   "description": "GitLab OpenClaw B 端中台",
   "type": "module",
   "files": [
