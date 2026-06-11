@@ -356,6 +356,29 @@ async function start() {
     console.warn('Database not available, starting without DB:', err.message)
   }
 
+  // 同步 gitlab-tools 插件到 ~/.openclaw/extensions/（确保 Gateway 能发现并加载）
+  try {
+    const { syncGitlabToolsExtensions, syncGitlabPluginOpenClawConfig } = await import('./utils/openclawCli.js')
+    syncGitlabToolsExtensions()
+    // 尝试从 DB 读取 GitLab 配置写入 openclaw.json
+    try {
+      const { default: AdminConfig } = await import('./db/models/adminConfig.js')
+      const [tokenRow, urlRow] = await Promise.all([
+        AdminConfig.findOne({ where: { config_key: 'gitlab_token' } }),
+        AdminConfig.findOne({ where: { config_key: 'gitlab_base_url' } })
+      ])
+      const glToken = tokenRow?.config_value?.trim()
+      const glUrl = urlRow?.config_value?.trim() || config.gitlab.baseUrl
+      syncGitlabPluginOpenClawConfig(glUrl, glToken)
+      console.log('[startup] gitlab-tools 插件配置已同步到 openclaw.json')
+    } catch {
+      // DB 未就绪时忽略
+    }
+    console.log('[startup] gitlab-tools 插件已同步到 ~/.openclaw/extensions/')
+  } catch (err) {
+    console.warn('[startup] gitlab-tools 插件同步失败:', err.message)
+  }
+
   // 恢复卡在 active 状态的会话（上次进程重启导致 exit 回调丢失）
   try {
     const stuckSessions = await AgentSession.findAll({

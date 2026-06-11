@@ -60,6 +60,11 @@ export function syncGitlabToolsPlugin(agentDir) {
   syncGitlabToolsTo(OPENCLAW_EXTENSIONS_DIR)
 }
 
+/** 仅同步 gitlab-tools 插件到全局扩展目录（~/.openclaw/extensions/），供 B 端启动时调用 */
+export function syncGitlabToolsExtensions() {
+  syncGitlabToolsTo(OPENCLAW_EXTENSIONS_DIR)
+}
+
 /**
  * 确保 openclaw.json 中 gitlab-tools 插件配置存在且正确
  *
