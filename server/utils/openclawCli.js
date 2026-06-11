@@ -12,12 +12,30 @@ const GITLAB_TOOLS_SRC = path.resolve(__dirname, '../plugins/gitlab-tools.js')
 const GITLAB_TOOLS_MANIFEST = path.resolve(__dirname, '../plugins/openclaw.plugin.json')
 const GITLAB_PLUGIN_ID = 'gitlab-tools'
 
+/** OpenClaw 全局扩展目录：~/.openclaw/extensions/ */
+const OPENCLAW_EXTENSIONS_DIR = path.join(os.homedir(), '.openclaw', 'extensions')
+
 /** 长消息包装脚本路径（绕过 Windows 命令行长度限制） */
 const AGENT_RUNNER_PATH = path.resolve(__dirname, 'openclaw-agent-runner.mjs')
 
-/** 将 gitlab-tools 插件以 OpenClaw 可识别格式部署到 agentDir/plugins/<id>/ */
-export function syncGitlabToolsPlugin(agentDir) {
-  const pluginDir = path.join(agentDir, 'plugins', GITLAB_PLUGIN_ID)
+/** gitlab-tools 插件标准 package.json */
+const GITLAB_TOOLS_PACKAGE_JSON = {
+  name: 'gitlab-tools',
+  version: '1.0.0',
+  type: 'module',
+  main: 'gitlab-tools.js',
+  private: true,
+  openclaw: {
+    extensions: ['./gitlab-tools.js']
+  }
+}
+
+/**
+ * 将 gitlab-tools 插件同步到目标目录，并修复 package.json
+ * @param {string} targetDir - 目标目录（agent plugins 或 extensions）
+ */
+function syncGitlabToolsTo(targetDir) {
+  const pluginDir = path.join(targetDir, GITLAB_PLUGIN_ID)
   fs.mkdirSync(pluginDir, { recursive: true })
 
   // 复制插件代码
@@ -28,15 +46,53 @@ export function syncGitlabToolsPlugin(agentDir) {
   if (fs.existsSync(GITLAB_TOOLS_MANIFEST)) {
     fs.copyFileSync(GITLAB_TOOLS_MANIFEST, path.join(pluginDir, 'openclaw.plugin.json'))
   }
-  // 生成最小 package.json（OpenClaw 插件发现必需）
-  const pkgPath = path.join(pluginDir, 'package.json')
-  if (!fs.existsSync(pkgPath)) {
-    fs.writeFileSync(pkgPath, JSON.stringify({
-      name: 'gitlab-tools',
-      version: '1.0.0',
-      main: 'gitlab-tools.js',
-      private: true
-    }, null, 2), 'utf-8')
+  // 覆写 package.json（含 type: module + openclaw.extensions，Gateway 发现必需）
+  fs.writeFileSync(path.join(pluginDir, 'package.json'),
+    JSON.stringify(GITLAB_TOOLS_PACKAGE_JSON, null, 2) + '\n', 'utf-8')
+}
+
+/** 将 gitlab-tools 插件以 OpenClaw 可识别格式部署到 agentDir/plugins/<id>/ 和 ~/.openclaw/extensions/ */
+export function syncGitlabToolsPlugin(agentDir) {
+  // 写入 agent 内部 plugins 目录（旧版兼容）
+  syncGitlabToolsTo(path.join(agentDir, 'plugins'))
+
+  // 写入全局扩展目录（Gateway 扫描目录）
+  syncGitlabToolsTo(OPENCLAW_EXTENSIONS_DIR)
+}
+
+/**
+ * 确保 openclaw.json 中 gitlab-tools 插件配置存在且正确
+ *
+ * 写入 plugins.entries.gitlab-tools.enabled = true
+ * 以及 gitlabBaseUrl / gitlabToken 配置
+ */
+export function syncGitlabPluginOpenClawConfig(gitlabBaseUrl, gitlabToken) {
+  const cfgPath = resolveOpenClawConfigPath()
+  if (!fs.existsSync(cfgPath)) return false
+
+  try {
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'))
+    cfg.plugins = cfg.plugins || {}
+    cfg.plugins.entries = cfg.plugins.entries || {}
+
+    const entry = cfg.plugins.entries['gitlab-tools'] || {}
+    entry.enabled = true
+    entry.config = entry.config || {}
+
+    // 只覆写空值（已有值不覆盖，避免覆盖用户手动修改）
+    if (gitlabBaseUrl && !entry.config.gitlabBaseUrl) {
+      entry.config.gitlabBaseUrl = gitlabBaseUrl
+    }
+    if (gitlabToken && !entry.config.gitlabToken) {
+      entry.config.gitlabToken = gitlabToken
+    }
+
+    cfg.plugins.entries['gitlab-tools'] = entry
+    fs.writeFileSync(cfgPath, `${JSON.stringify(cfg, null, 2)}\n`, 'utf-8')
+    return true
+  } catch (err) {
+    console.warn(`[openclawCli] syncGitlabPluginOpenClawConfig 失败: ${err.message}`)
+    return false
   }
 }
 
@@ -494,13 +550,27 @@ export function syncAgentWorkspaceFiles(agentDir, workspace) {
 
 /**
  * 调度前确保 OpenClaw 注册信息与 workspace 文件就绪
+ *
+ * @param {string} cliName - Agent CLI 名称
+ * @param {object|null} template - Agent 模板（可选）
+ * @param {object} [gitlabConfig] - GitLab 连接配置（从 DB 读取）
+ * @param {string} [gitlabConfig.gitlabBaseUrl] - GitLab 实例 URL
+ * @param {string} [gitlabConfig.gitlabToken] - GitLab Token
  */
-export function prepareAgentRuntime(cliName, template = null) {
+export function prepareAgentRuntime(cliName, template = null, gitlabConfig = null) {
   const agentDir = resolveAgentDir(cliName)
   const workspace = resolveAgentRuntimeWorkspace(template, cliName)
   ensureWorkspaceDir(agentDir)
   ensureWorkspaceDir(workspace)
+
+  // 同步 gitlab-tools 插件到 agent plugins/ 和 ~/.openclaw/extensions/
   syncGitlabToolsPlugin(agentDir)
+
+  // 同步 GitLab 连接配置到 openclaw.json
+  if (gitlabConfig?.gitlabBaseUrl || gitlabConfig?.gitlabToken) {
+    syncGitlabPluginOpenClawConfig(gitlabConfig.gitlabBaseUrl, gitlabConfig.gitlabToken)
+  }
+
   syncAgentWorkspaceFiles(agentDir, workspace)
   const synced = syncOpenClawAgentRegistry(cliName, { workspace, agentDir })
   if (synced) {

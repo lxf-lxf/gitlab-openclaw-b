@@ -692,7 +692,21 @@ class AgentManager {
           metadata: { agent_name: displayName }
         })
 
-    const { workspace } = prepareAgentRuntime(cliName, spawnContext?.template || null)
+    // 调度前读取 GitLab 连接配置，同步到 OpenClaw 插件配置
+    let gitlabConfig = null
+    try {
+      const [tokenRow, urlRow] = await Promise.all([
+        AdminConfig.findOne({ where: { config_key: 'gitlab_token' } }),
+        AdminConfig.findOne({ where: { config_key: 'gitlab_base_url' } })
+      ])
+      const glToken = tokenRow?.config_value?.trim()
+      const glUrl = urlRow?.config_value?.trim() || config.gitlab.baseUrl
+      if (glToken && glUrl) {
+        gitlabConfig = { gitlabBaseUrl: glUrl, gitlabToken: glToken }
+      }
+    } catch (_) { /* ignore DB read errors */ }
+
+    const { workspace } = prepareAgentRuntime(cliName, spawnContext?.template || null, gitlabConfig)
 
     const { child, cleanup: msgCleanup } = spawnAgentWithMessage(
       cliName, sessionKey,
