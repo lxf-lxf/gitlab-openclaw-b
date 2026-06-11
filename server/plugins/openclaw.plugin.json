@@ -1,7 +1,7 @@
 {
   "id": "gitlab-tools",
   "name": "GitLab Tools",
-  "description": "GitLab Issue/MR 工具集 - Issue 查询/更新/评论、MR 查询/评论/合并/审批、状态标签管理",
+  "description": "GitLab Issue/MR 查询、评论、合并、审批工具集",
   "version": "1.0.0",
   "activation": {
     "onStartup": true
@@ -31,15 +31,12 @@
       "gitlab_issue_comment",
       "gitlab_mr_list",
       "gitlab_mr_get",
-      "gitlab_add_label",
-      "gitlab_set_state_label",
       "gitlab_flow_state",
       "gitlab_project_info",
       "gitlab_mr_comment",
       "gitlab_mr_update",
       "gitlab_mr_merge",
-      "gitlab_mr_approve",
-      "gitlab_mr_add_label"
+      "gitlab_mr_approve"
     ]
   }
 }

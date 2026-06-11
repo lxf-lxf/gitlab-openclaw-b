@@ -83,7 +83,7 @@ function getMrIid(params) {
 export default definePluginEntry({
   id: "gitlab-tools",
   name: "GitLab Tools",
-  description: "GitLab Issue 状态机管理工具 - 创建/查询/更新 Issue、MR 和标签",
+  description: "GitLab Issue/MR 查询、评论、合并、审批工具集",
 
   configSchema: {
     type: "object",
@@ -130,7 +130,7 @@ export default definePluginEntry({
     api.registerTool({
       name: "gitlab_issue_update",
       label: "GitLab: 更新 Issue",
-      description: "更新 GitLab Issue 的标签、状态、指派人等",
+      description: "更新 GitLab Issue 的状态、指派人、标题、描述等",
       parameters: {
         type: "object",
         properties: {
@@ -141,7 +141,6 @@ export default definePluginEntry({
             enum: ["close", "reopen"],
             description: "状态变更事件（关闭/重新打开）"
           },
-          labels: { type: "string", description: "标签列表，逗号分隔" },
           assignee_ids: {
             type: "array",
             items: { type: "number" },
@@ -155,7 +154,6 @@ export default definePluginEntry({
       execute: async (toolCallId, params, signal, onUpdate) => {
         const body = {};
         if (params.state_event) body.state_event = params.state_event;
-        if (params.labels !== undefined) body.labels = params.labels;
         if (params.assignee_ids) body.assignee_ids = params.assignee_ids;
         if (params.title) body.title = params.title;
         if (params.description) body.description = params.description;
@@ -235,61 +233,6 @@ export default definePluginEntry({
           // 没有审批权限或非 Premium 版本
         }
         return JSON.stringify({ ...mr, approvals }, null, 2);
-      }
-    });
-
-    // ── 6. gitlab_add_label ──
-    api.registerTool({
-      name: "gitlab_add_label",
-      label: "GitLab: 添加标签",
-      description: "为 GitLab Issue 添加标签",
-      parameters: {
-        type: "object",
-        properties: {
-          project_id: { type: "string", description: PROJECT_ID_PARAM_DESC },
-          issue_iid: { type: "string", description: "Issue IID" },
-          labels: { type: "string", description: "要设置的标签，逗号分隔" }
-        },
-        required: ["project_id", "issue_iid", "labels"]
-      },
-      execute: async (toolCallId, params, signal, onUpdate) => {
-        const issue = await gitlabApi(config, "GET", `/projects/${encodeURIComponent(resolveProjectId(config, params))}/issues/${resolveIssueIid(params)}`);
-        const existingLabels = (issue.labels || []);
-        const newLabels = [...new Set([...existingLabels, ...params.labels.split(",").map(l => l.trim())])];
-        const result = await gitlabApi(config, "PUT", `/projects/${encodeURIComponent(resolveProjectId(config, params))}/issues/${resolveIssueIid(params)}`, {
-          labels: newLabels.join(",")
-        });
-        return JSON.stringify({ labels: result.labels }, null, 2);
-      }
-    });
-
-    // ── 7. gitlab_set_state_label ──
-    api.registerTool({
-      name: "gitlab_set_state_label",
-      label: "GitLab: 设置状态标签",
-      description: "设置 GitLab Issue 的状态标签（待办/进行中/待验收/已完成/已取消），自动替换旧状态标签",
-      parameters: {
-        type: "object",
-        properties: {
-          project_id: { type: "string", description: PROJECT_ID_PARAM_DESC },
-          issue_iid: { type: "string", description: "Issue IID" },
-          state: {
-            type: "string",
-            enum: ["待办", "进行中", "待验收", "已完成", "已取消"],
-            description: "目标状态"
-          }
-        },
-        required: ["project_id", "issue_iid", "state"]
-      },
-      execute: async (toolCallId, params, signal, onUpdate) => {
-        const issue = await gitlabApi(config, "GET", `/projects/${encodeURIComponent(resolveProjectId(config, params))}/issues/${resolveIssueIid(params)}`);
-        const existingLabels = (issue.labels || []);
-        const cleaned = existingLabels.filter(l => !l.startsWith("status::"));
-        cleaned.push(`status::${params.state}`);
-        const result = await gitlabApi(config, "PUT", `/projects/${encodeURIComponent(resolveProjectId(config, params))}/issues/${resolveIssueIid(params)}`, {
-          labels: cleaned.join(",")
-        });
-        return JSON.stringify({ state: params.state, labels: result.labels }, null, 2);
       }
     });
 
@@ -383,7 +326,7 @@ export default definePluginEntry({
     api.registerTool({
       name: "gitlab_mr_update",
       label: "GitLab: 更新 MR",
-      description: "更新 GitLab 合并请求的标题、描述、标签、指派人等",
+      description: "更新 GitLab 合并请求的标题、描述、指派人等",
       parameters: {
         type: "object",
         properties: {
@@ -391,7 +334,6 @@ export default definePluginEntry({
           mr_iid: { type: "string", description: "MR IID" },
           title: { type: "string", description: "新标题" },
           description: { type: "string", description: "新描述" },
-          labels: { type: "string", description: "标签列表，逗号分隔" },
           assignee_ids: { type: "array", items: { type: "number" }, description: "指派用户 ID 列表" },
           state_event: { type: "string", enum: ["close", "reopen"], description: "状态变更" }
         },
@@ -401,7 +343,6 @@ export default definePluginEntry({
         const body = {};
         if (params.title) body.title = params.title;
         if (params.description) body.description = params.description;
-        if (params.labels !== undefined) body.labels = params.labels;
         if (params.assignee_ids) body.assignee_ids = params.assignee_ids;
         if (params.state_event) body.state_event = params.state_event;
         const result = await gitlabApi(config, "PUT",
@@ -455,34 +396,6 @@ export default definePluginEntry({
           `/projects/${encodeURIComponent(resolveProjectId(config, params))}/merge_requests/${getMrIid(params)}/approve`
         );
         return JSON.stringify(result, null, 2);
-      }
-    });
-
-    // ── 14. gitlab_mr_add_label ──
-    api.registerTool({
-      name: "gitlab_mr_add_label",
-      label: "GitLab: MR 添加标签",
-      description: "为 GitLab 合并请求添加标签",
-      parameters: {
-        type: "object",
-        properties: {
-          project_id: { type: "string", description: PROJECT_ID_PARAM_DESC },
-          mr_iid: { type: "string", description: "MR IID" },
-          labels: { type: "string", description: "要设置的标签，逗号分隔" }
-        },
-        required: ["project_id", "mr_iid", "labels"]
-      },
-      execute: async (toolCallId, params, signal, onUpdate) => {
-        const mr = await gitlabApi(config, "GET",
-          `/projects/${encodeURIComponent(resolveProjectId(config, params))}/merge_requests/${getMrIid(params)}`
-        );
-        const existingLabels = (mr.labels || []);
-        const newLabels = [...new Set([...existingLabels, ...params.labels.split(",").map(l => l.trim())])];
-        const result = await gitlabApi(config, "PUT",
-          `/projects/${encodeURIComponent(resolveProjectId(config, params))}/merge_requests/${getMrIid(params)}`,
-          { labels: newLabels.join(",") }
-        );
-        return JSON.stringify({ labels: result.labels }, null, 2);
       }
     });
   }
